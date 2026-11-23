@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">NetCorte</string>
+    <string name="status_cut">Internet CORTADO</string>
+    <string name="status_on">Internet activo</string>
+    <string name="btn_cut">Cortar internet</string>
+    <string name="btn_restore">Restaurar internet</string>
+    <string name="float_show">Mostrar botón flotante</string>
+    <string name="float_hide">Ocultar botón flotante</string>
+    <string name="size_label">Tamaño del botón: %1$d dp</string>
+    <string name="alpha_label">Opacidad del botón: %1$d %%</string>
+    <string name="perm_title">Permisos</string>
+    <string name="perm_overlay">Permitir mostrar sobre otras apps</string>
+    <string name="perm_vpn">Autorizar conexión VPN</string>
+    <string name="overlay_needed">Activa el permiso para mostrar sobre otras apps y vuelve a intentarlo</string>
+    <string name="vpn_ok">Permiso de VPN ya concedido</string>
+    <string name="vpn_denied">Sin permiso de VPN no se puede cortar el internet</string>
+    <string name="info">Toca el botón flotante para cortar todo el tráfico y tócalo otra vez para restaurarlo. Arrástralo para moverlo. Verde = internet activo, rojo = cortado.</string>
+    <string name="notif_channel">Botón flotante</string>
+    <string name="notif_title">Botón flotante activo</string>
+    <string name="notif_text">Toca para abrir los ajustes</string>
+    <string name="notif_action">Cortar / Restaurar</string>
+</resources>
