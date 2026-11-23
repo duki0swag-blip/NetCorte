@@ -5,11 +5,963 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Crear estructura del proyecto (solo la primera vez)
+        run: |
+          if [ -f .netcorte-ok ]; then echo 'Proyecto ya creado, se omite'; exit 0; fi
+          rm -rf app
+          mkdir -p app app/src/main app/src/main/java/com/netcorte/app app/src/main/res/drawable app/src/main/res/layout app/src/main/res/values
+          cat > settings.gradle.kts <<'NETCORTE_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "NetCorte"
+          include(":app")
+          NETCORTE_EOF
+          cat > build.gradle.kts <<'NETCORTE_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          NETCORTE_EOF
+          cat > gradle.properties <<'NETCORTE_EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          org.gradle.caching=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          NETCORTE_EOF
+          cat > .gitignore <<'NETCORTE_EOF'
+          *.iml
+          .gradle/
+          build/
+          local.properties
+          .idea/
+          .DS_Store
+          *.apk
+          NETCORTE_EOF
+          cat > README.md <<'NETCORTE_EOF'
+          # NetCorte
+
+          App Android (Kotlin) con botón flotante que corta todo el tráfico de internet (VPN local "agujero negro") y lo restaura al instante.
+
+          ## Compilar el APK en GitHub
+          1. Crea un repositorio y sube TODO el contenido de esta carpeta (incluida `.github`).
+          2. Ve a la pestaña **Actions** → "Build APK" (corre solo en cada push, o pulsa *Run workflow*).
+          3. Al terminar, abre la ejecución y descarga **NetCorte-apk** (contiene `app-release.apk`).
+          4. Instálalo en el teléfono (permite instalar apps de origen desconocido).
+
+          ## Primer uso
+          1. Abre la app → **Permitir mostrar sobre otras apps**.
+          2. **Autorizar conexión VPN**.
+          3. **Mostrar botón flotante** → toca el círculo para cortar / restaurar. Arrástralo para moverlo.
+          NETCORTE_EOF
+          cat > app/build.gradle.kts <<'NETCORTE_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.netcorte.app"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.netcorte.app"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0.0"
+              }
+
+              buildTypes {
+                  release {
+                      // Optimizado y pequeño, firmado con la clave debug para que sea instalable.
+                      isMinifyEnabled = true
+                      isShrinkResources = true
+                      proguardFiles(
+                          getDefaultProguardFile("proguard-android-optimize.txt"),
+                          "proguard-rules.pro"
+                      )
+                      signingConfig = signingConfigs.getByName("debug")
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+
+              lint { checkReleaseBuilds = false }
+          }
+
+          // Sin dependencias externas: APK mínimo y arranque rápido en teléfonos modestos.
+          NETCORTE_EOF
+          cat > app/proguard-rules.pro <<'NETCORTE_EOF'
+          # Sin reglas especiales: la app no usa reflexión ni librerías externas.
+          NETCORTE_EOF
+          cat > app/src/main/AndroidManifest.xml <<'NETCORTE_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="@string/app_name"
+                  android:theme="@style/AppTheme">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".FloatingButtonService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="floating_overlay_button" />
+                  </service>
+
+                  <service
+                      android:name=".KillSwitchVpnService"
+                      android:exported="false"
+                      android:permission="android.permission.BIND_VPN_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.net.VpnService" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          NETCORTE_EOF
+          cat > app/src/main/java/com/netcorte/app/KillSwitchState.kt <<'NETCORTE_EOF'
+          package com.netcorte.app
+
+          import android.os.Handler
+          import android.os.Looper
+          import java.util.concurrent.CopyOnWriteArraySet
+
+          /**
+           * Estado compartido (en memoria) del corte de internet.
+           * La UI y el botón flotante se suscriben para reflejar el estado sin sondeos (cero consumo en reposo).
+           */
+          object KillSwitchState {
+              @Volatile
+              var active: Boolean = false
+                  private set
+
+              private val main = Handler(Looper.getMainLooper())
+              private val listeners = CopyOnWriteArraySet<(Boolean) -> Unit>()
+
+              fun set(value: Boolean) {
+                  active = value
+                  main.post { listeners.forEach { it(value) } }
+              }
+
+              fun addListener(l: (Boolean) -> Unit) { listeners.add(l) }
+              fun removeListener(l: (Boolean) -> Unit) { listeners.remove(l) }
+          }
+          NETCORTE_EOF
+          cat > app/src/main/java/com/netcorte/app/Prefs.kt <<'NETCORTE_EOF'
+          package com.netcorte.app
+
+          import android.content.Context
+
+          /** Ajustes persistentes: tamaño, opacidad, posición del botón y si debe mostrarse. */
+          object Prefs {
+              const val SIZE_MIN = 32
+              const val SIZE_MAX = 120
+              const val ALPHA_MIN = 30
+              const val ALPHA_MAX = 100
+
+              private fun sp(c: Context) =
+                  c.applicationContext.getSharedPreferences("netcorte", Context.MODE_PRIVATE)
+
+              fun sizeDp(c: Context) = sp(c).getInt("size", 64)
+              fun setSizeDp(c: Context, v: Int) = sp(c).edit().putInt("size", v).apply()
+
+              fun alphaPct(c: Context) = sp(c).getInt("alpha", 90)
+              fun setAlphaPct(c: Context, v: Int) = sp(c).edit().putInt("alpha", v).apply()
+
+              fun posX(c: Context) = sp(c).getInt("x", -1)
+              fun posY(c: Context) = sp(c).getInt("y", -1)
+              fun setPos(c: Context, x: Int, y: Int) = sp(c).edit().putInt("x", x).putInt("y", y).apply()
+
+              fun floatingEnabled(c: Context) = sp(c).getBoolean("floating", false)
+              fun setFloatingEnabled(c: Context, v: Boolean) = sp(c).edit().putBoolean("floating", v).apply()
+          }
+          NETCORTE_EOF
+          cat > app/src/main/java/com/netcorte/app/KillSwitchController.kt <<'NETCORTE_EOF'
+          package com.netcorte.app
+
+          import android.content.Context
+          import android.content.Intent
+          import android.net.VpnService
+
+          /** Punto único para activar / desactivar el corte desde cualquier lugar. */
+          object KillSwitchController {
+
+              fun toggle(ctx: Context) = if (KillSwitchState.active) stop(ctx) else start(ctx)
+
+              fun start(ctx: Context) {
+                  if (VpnService.prepare(ctx) != null) {
+                      // Falta el permiso de VPN: se pide desde la Activity y luego se activa solo.
+                      ctx.startActivity(
+                          Intent(ctx, MainActivity::class.java)
+                              .putExtra(MainActivity.EXTRA_REQUEST_VPN, true)
+                              .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      )
+                      return
+                  }
+                  ctx.startService(
+                      Intent(ctx, KillSwitchVpnService::class.java).setAction(KillSwitchVpnService.ACTION_START)
+                  )
+              }
+
+              fun stop(ctx: Context) {
+                  ctx.startService(
+                      Intent(ctx, KillSwitchVpnService::class.java).setAction(KillSwitchVpnService.ACTION_STOP)
+                  )
+              }
+          }
+          NETCORTE_EOF
+          cat > app/src/main/java/com/netcorte/app/KillSwitchVpnService.kt <<'NETCORTE_EOF'
+          package com.netcorte.app
+
+          import android.content.Intent
+          import android.net.VpnService
+          import android.os.ParcelFileDescriptor
+
+          /**
+           * Corte total de internet con un "agujero negro":
+           * crea una VPN local que captura TODO el tráfico (IPv4 e IPv6) y nunca lo reenvía.
+           * No lee ni procesa paquetes => consumo de CPU y batería prácticamente nulo.
+           * Al cerrar la interfaz, Android restaura la red al instante.
+           */
+          class KillSwitchVpnService : VpnService() {
+
+              private var tun: ParcelFileDescriptor? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  when (intent?.action) {
+                      ACTION_STOP -> stopBlocking()
+                      ACTION_TOGGLE -> if (tun != null) stopBlocking() else startBlocking()
+                      else -> startBlocking()
+                  }
+                  return START_NOT_STICKY
+              }
+
+              private fun startBlocking() {
+                  if (tun != null) return
+                  tun = try {
+                      Builder()
+                          .setSession("NetCorte")
+                          .addAddress("10.255.255.1", 32)
+                          .addRoute("0.0.0.0", 0)      // todo IPv4
+                          .addAddress("fd00::1", 128)
+                          .addRoute("::", 0)           // todo IPv6
+                          .setBlocking(true)
+                          .establish()
+                  } catch (e: Exception) {
+                      null
+                  }
+                  if (tun == null) {
+                      KillSwitchState.set(false)
+                      stopSelf()
+                  } else {
+                      KillSwitchState.set(true)
+                  }
+              }
+
+              private fun stopBlocking() {
+                  try { tun?.close() } catch (_: Exception) {}
+                  tun = null
+                  KillSwitchState.set(false)
+                  stopSelf()
+              }
+
+              // El usuario revocó el permiso o activó otra VPN.
+              override fun onRevoke() = stopBlocking()
+
+              override fun onDestroy() {
+                  try { tun?.close() } catch (_: Exception) {}
+                  tun = null
+                  KillSwitchState.set(false)
+                  super.onDestroy()
+              }
+
+              companion object {
+                  const val ACTION_START = "com.netcorte.app.START"
+                  const val ACTION_STOP = "com.netcorte.app.STOP"
+                  const val ACTION_TOGGLE = "com.netcorte.app.TOGGLE"
+              }
+          }
+          NETCORTE_EOF
+          cat > app/src/main/java/com/netcorte/app/FloatingButtonView.kt <<'NETCORTE_EOF'
+          package com.netcorte.app
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.RectF
+          import android.view.View
+
+          /**
+           * Botón dibujado a mano con Canvas: una sola vista, sin layouts ni imágenes.
+           * Verde = internet activo. Rojo = internet cortado.
+           */
+          class FloatingButtonView(context: Context) : View(context) {
+
+              private val bg = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+              private val fg = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE
+                  color = Color.WHITE
+                  strokeCap = Paint.Cap.ROUND
+              }
+              private val oval = RectF()
+              private var cut = false
+
+              init { bg.color = COLOR_OK }
+
+              fun setCut(value: Boolean) {
+                  if (value == cut) return
+                  cut = value
+                  bg.color = if (cut) COLOR_CUT else COLOR_OK
+                  invalidate()
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  val w = width.toFloat()
+                  val cx = w / 2f
+                  val cy = height / 2f
+                  canvas.drawCircle(cx, cy, w / 2f, bg)
+
+                  // Símbolo de encendido
+                  val r = w * 0.20f
+                  fg.strokeWidth = w * 0.07f
+                  oval.set(cx - r, cy - r, cx + r, cy + r)
+                  canvas.drawArc(oval, -45f, 270f, false, fg)
+                  canvas.drawLine(cx, cy - r * 1.15f, cx, cy - r * 0.1f, fg)
+              }
+
+              companion object {
+                  private val COLOR_OK = Color.parseColor("#2E7D32")
+                  private val COLOR_CUT = Color.parseColor("#E53935")
+              }
+          }
+          NETCORTE_EOF
+          cat > app/src/main/java/com/netcorte/app/FloatingButtonService.kt <<'NETCORTE_EOF'
+          package com.netcorte.app
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.content.res.Configuration
+          import android.graphics.PixelFormat
+          import android.os.Build
+          import android.os.IBinder
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.HapticFeedbackConstants
+          import android.view.MotionEvent
+          import android.view.ViewConfiguration
+          import android.view.WindowManager
+          import kotlin.math.abs
+          import kotlin.math.max
+          import kotlin.math.min
+
+          /**
+           * Muestra el botón flotante sobre cualquier app.
+           * - Toque: corta / restaura internet.
+           * - Arrastrar: mueve el botón (la posición se guarda).
+           */
+          class FloatingButtonService : Service() {
+
+              private var wm: WindowManager? = null
+              private var button: FloatingButtonView? = null
+              private var params: WindowManager.LayoutParams? = null
+
+              private val stateListener: (Boolean) -> Unit = { button?.setCut(it) }
+
+              override fun onCreate() {
+                  super.onCreate()
+                  running = true
+                  instance = this
+                  try {
+                      startAsForeground()
+                  } catch (e: Exception) {
+                      stopSelf(); return
+                  }
+                  if (!Settings.canDrawOverlays(this)) { stopSelf(); return }
+
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  createButton()
+                  KillSwitchState.addListener(stateListener)
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int) = START_STICKY
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              // ---------- Botón ----------
+
+              private fun createButton() {
+                  val size = dp(Prefs.sizeDp(this))
+                  val metrics = resources.displayMetrics
+                  @Suppress("DEPRECATION")
+                  val type = if (Build.VERSION.SDK_INT >= 26)
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                  else
+                      WindowManager.LayoutParams.TYPE_PHONE
+
+                  val p = WindowManager.LayoutParams(
+                      size, size, type,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  p.gravity = Gravity.TOP or Gravity.START
+                  val savedX = Prefs.posX(this)
+                  val savedY = Prefs.posY(this)
+                  p.x = if (savedX >= 0) savedX else metrics.widthPixels - size - dp(16)
+                  p.y = if (savedY >= 0) savedY else (metrics.heightPixels * 0.4f).toInt()
+                  params = p
+
+                  val v = FloatingButtonView(this)
+                  v.alpha = Prefs.alphaPct(this) / 100f
+                  v.setCut(KillSwitchState.active)
+                  attachTouch(v)
+                  button = v
+                  wm?.addView(v, p)
+              }
+
+              private fun attachTouch(v: FloatingButtonView) {
+                  val slop = ViewConfiguration.get(this).scaledTouchSlop
+                  var startX = 0; var startY = 0
+                  var downX = 0f; var downY = 0f
+                  var moved = false
+
+                  v.setOnTouchListener { view, e ->
+                      val p = params ?: return@setOnTouchListener false
+                      when (e.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> {
+                              startX = p.x; startY = p.y
+                              downX = e.rawX; downY = e.rawY
+                              moved = false
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = e.rawX - downX
+                              val dy = e.rawY - downY
+                              if (!moved && (abs(dx) > slop || abs(dy) > slop)) moved = true
+                              if (moved) {
+                                  p.x = startX + dx.toInt()
+                                  p.y = startY + dy.toInt()
+                                  clamp(p)
+                                  wm?.updateViewLayout(view, p)
+                              }
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              if (moved) {
+                                  Prefs.setPos(this, p.x, p.y)
+                              } else {
+                                  view.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                                  KillSwitchController.toggle(this)
+                              }
+                          }
+                      }
+                      true
+                  }
+              }
+
+              /** Aplica tamaño y opacidad nuevos al instante (llamado desde la pantalla de ajustes). */
+              fun applyConfig() {
+                  val p = params ?: return
+                  val v = button ?: return
+                  val size = dp(Prefs.sizeDp(this))
+                  p.width = size
+                  p.height = size
+                  clamp(p)
+                  v.alpha = Prefs.alphaPct(this) / 100f
+                  wm?.updateViewLayout(v, p)
+              }
+
+              private fun clamp(p: WindowManager.LayoutParams) {
+                  val m = resources.displayMetrics
+                  p.x = max(0, min(p.x, m.widthPixels - p.width))
+                  p.y = max(0, min(p.y, m.heightPixels - p.height))
+              }
+
+              override fun onConfigurationChanged(newConfig: Configuration) {
+                  super.onConfigurationChanged(newConfig)
+                  val p = params ?: return
+                  val v = button ?: return
+                  clamp(p)
+                  wm?.updateViewLayout(v, p)
+              }
+
+              // ---------- Notificación (obligatoria para servicios en primer plano) ----------
+
+              private fun startAsForeground() {
+                  val channelId = "netcorte_floating"
+                  val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      nm.createNotificationChannel(
+                          NotificationChannel(channelId, getString(R.string.notif_channel), NotificationManager.IMPORTANCE_LOW)
+                      )
+                  }
+                  val open = PendingIntent.getActivity(
+                      this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val toggle = PendingIntent.getService(
+                      this, 1,
+                      Intent(this, KillSwitchVpnService::class.java).setAction(KillSwitchVpnService.ACTION_TOGGLE),
+                      PendingIntent.FLAG_IMMUTABLE
+                  )
+                  @Suppress("DEPRECATION")
+                  val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, channelId) else Notification.Builder(this)
+                  val n = b.setSmallIcon(R.drawable.ic_notif)
+                      .setContentTitle(getString(R.string.notif_title))
+                      .setContentText(getString(R.string.notif_text))
+                      .setContentIntent(open)
+                      .addAction(Notification.Action.Builder(null, getString(R.string.notif_action), toggle).build())
+                      .setOngoing(true)
+                      .build()
+
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      startForeground(1, n, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  } else {
+                      startForeground(1, n)
+                  }
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density + 0.5f).toInt()
+
+              override fun onDestroy() {
+                  KillSwitchState.removeListener(stateListener)
+                  try { button?.let { wm?.removeView(it) } } catch (_: Exception) {}
+                  button = null
+                  instance = null
+                  running = false
+                  super.onDestroy()
+              }
+
+              companion object {
+                  @Volatile var running = false
+                  @Volatile var instance: FloatingButtonService? = null
+              }
+          }
+          NETCORTE_EOF
+          cat > app/src/main/java/com/netcorte/app/MainActivity.kt <<'NETCORTE_EOF'
+          package com.netcorte.app
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.net.VpnService
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.SeekBar
+          import android.widget.TextView
+          import android.widget.Toast
+
+          /** Pantalla de opciones: permisos, mostrar/ocultar botón, tamaño y opacidad. */
+          class MainActivity : Activity() {
+
+              companion object {
+                  const val EXTRA_REQUEST_VPN = "request_vpn"
+                  private const val REQ_VPN = 1
+                  private const val REQ_NOTIF = 2
+              }
+
+              private lateinit var txtStatus: TextView
+              private lateinit var btnToggle: Button
+              private lateinit var btnFloating: Button
+              private lateinit var txtSize: TextView
+              private lateinit var txtAlpha: TextView
+              private lateinit var seekSize: SeekBar
+              private lateinit var seekAlpha: SeekBar
+
+              private var startAfterVpn = false
+              private val stateListener: (Boolean) -> Unit = { refreshUi() }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_main)
+
+                  txtStatus = findViewById(R.id.txtStatus)
+                  btnToggle = findViewById(R.id.btnToggle)
+                  btnFloating = findViewById(R.id.btnFloating)
+                  txtSize = findViewById(R.id.txtSize)
+                  txtAlpha = findViewById(R.id.txtAlpha)
+                  seekSize = findViewById(R.id.seekSize)
+                  seekAlpha = findViewById(R.id.seekAlpha)
+
+                  // Tamaño
+                  seekSize.max = Prefs.SIZE_MAX - Prefs.SIZE_MIN
+                  seekSize.progress = Prefs.sizeDp(this) - Prefs.SIZE_MIN
+                  txtSize.text = getString(R.string.size_label, Prefs.sizeDp(this))
+                  seekSize.setOnSeekBarChangeListener(object : SimpleSeekListener() {
+                      override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
+                          val v = p + Prefs.SIZE_MIN
+                          Prefs.setSizeDp(this@MainActivity, v)
+                          txtSize.text = getString(R.string.size_label, v)
+                          FloatingButtonService.instance?.applyConfig()
+                      }
+                  })
+
+                  // Opacidad
+                  seekAlpha.max = Prefs.ALPHA_MAX - Prefs.ALPHA_MIN
+                  seekAlpha.progress = Prefs.alphaPct(this) - Prefs.ALPHA_MIN
+                  txtAlpha.text = getString(R.string.alpha_label, Prefs.alphaPct(this))
+                  seekAlpha.setOnSeekBarChangeListener(object : SimpleSeekListener() {
+                      override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
+                          val v = p + Prefs.ALPHA_MIN
+                          Prefs.setAlphaPct(this@MainActivity, v)
+                          txtAlpha.text = getString(R.string.alpha_label, v)
+                          FloatingButtonService.instance?.applyConfig()
+                      }
+                  })
+
+                  btnToggle.setOnClickListener {
+                      if (KillSwitchState.active) KillSwitchController.stop(this) else startBlocking()
+                  }
+                  btnFloating.setOnClickListener { toggleFloating() }
+                  findViewById<Button>(R.id.btnOverlay).setOnClickListener { openOverlaySettings() }
+                  findViewById<Button>(R.id.btnVpn).setOnClickListener {
+                      startAfterVpn = false
+                      val i = VpnService.prepare(this)
+                      if (i != null) startActivityForResult(i, REQ_VPN)
+                      else Toast.makeText(this, R.string.vpn_ok, Toast.LENGTH_SHORT).show()
+                  }
+
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIF)
+                  }
+
+                  // Si el botón estaba activado, se restaura al abrir la app.
+                  if (Prefs.floatingEnabled(this) && Settings.canDrawOverlays(this) && !FloatingButtonService.running) {
+                      startFloating()
+                  }
+
+                  handleIntent(intent)
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  setIntent(intent)
+                  handleIntent(intent)
+              }
+
+              private fun handleIntent(i: Intent?) {
+                  if (i?.getBooleanExtra(EXTRA_REQUEST_VPN, false) == true) {
+                      i.removeExtra(EXTRA_REQUEST_VPN)
+                      startBlocking()
+                  }
+              }
+
+              // ---------- Acciones ----------
+
+              private fun startBlocking() {
+                  val i = VpnService.prepare(this)
+                  if (i != null) {
+                      startAfterVpn = true
+                      startActivityForResult(i, REQ_VPN)
+                  } else {
+                      KillSwitchController.start(this)
+                  }
+              }
+
+              private fun toggleFloating() {
+                  if (FloatingButtonService.running) {
+                      Prefs.setFloatingEnabled(this, false)
+                      stopService(Intent(this, FloatingButtonService::class.java))
+                      btnFloating.postDelayed({ refreshUi() }, 300)
+                  } else {
+                      if (!Settings.canDrawOverlays(this)) {
+                          Toast.makeText(this, R.string.overlay_needed, Toast.LENGTH_LONG).show()
+                          openOverlaySettings()
+                          return
+                      }
+                      Prefs.setFloatingEnabled(this, true)
+                      startFloating()
+                      btnFloating.postDelayed({ refreshUi() }, 300)
+                  }
+              }
+
+              private fun startFloating() {
+                  val i = Intent(this, FloatingButtonService::class.java)
+                  if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+              }
+
+              private fun openOverlaySettings() {
+                  startActivity(
+                      Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+                  )
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == REQ_VPN) {
+                      if (resultCode == RESULT_OK) {
+                          if (startAfterVpn) KillSwitchController.start(this)
+                          else Toast.makeText(this, R.string.vpn_ok, Toast.LENGTH_SHORT).show()
+                      } else {
+                          Toast.makeText(this, R.string.vpn_denied, Toast.LENGTH_LONG).show()
+                      }
+                      startAfterVpn = false
+                  }
+              }
+
+              // ---------- UI ----------
+
+              private fun refreshUi() {
+                  val cut = KillSwitchState.active
+                  txtStatus.setText(if (cut) R.string.status_cut else R.string.status_on)
+                  txtStatus.setTextColor(if (cut) 0xFFE53935.toInt() else 0xFF2E7D32.toInt())
+                  btnToggle.setText(if (cut) R.string.btn_restore else R.string.btn_cut)
+                  btnFloating.setText(if (FloatingButtonService.running) R.string.float_hide else R.string.float_show)
+              }
+
+              override fun onStart() {
+                  super.onStart()
+                  KillSwitchState.addListener(stateListener)
+                  refreshUi()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refreshUi()
+              }
+
+              override fun onStop() {
+                  KillSwitchState.removeListener(stateListener)
+                  super.onStop()
+              }
+
+              private abstract class SimpleSeekListener : SeekBar.OnSeekBarChangeListener {
+                  override fun onStartTrackingTouch(seekBar: SeekBar) {}
+                  override fun onStopTrackingTouch(seekBar: SeekBar) {}
+              }
+          }
+          NETCORTE_EOF
+          cat > app/src/main/res/layout/activity_main.xml <<'NETCORTE_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:fillViewport="true">
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:orientation="vertical"
+                  android:padding="20dp">
+
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="@string/app_name"
+                      android:textSize="28sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:id="@+id/txtStatus"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="12dp"
+                      android:textSize="22sp"
+                      android:textStyle="bold" />
+
+                  <Button
+                      android:id="@+id/btnToggle"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="12dp" />
+
+                  <Button
+                      android:id="@+id/btnFloating"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="8dp" />
+
+                  <TextView
+                      android:id="@+id/txtSize"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="24dp"
+                      android:textSize="16sp" />
+
+                  <SeekBar
+                      android:id="@+id/seekSize"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="4dp" />
+
+                  <TextView
+                      android:id="@+id/txtAlpha"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="16dp"
+                      android:textSize="16sp" />
+
+                  <SeekBar
+                      android:id="@+id/seekAlpha"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="4dp" />
+
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="24dp"
+                      android:text="@string/perm_title"
+                      android:textSize="16sp"
+                      android:textStyle="bold" />
+
+                  <Button
+                      android:id="@+id/btnOverlay"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="4dp"
+                      android:text="@string/perm_overlay" />
+
+                  <Button
+                      android:id="@+id/btnVpn"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="@string/perm_vpn" />
+
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="16dp"
+                      android:text="@string/info"
+                      android:textSize="13sp" />
+              </LinearLayout>
+          </ScrollView>
+          NETCORTE_EOF
+          cat > app/src/main/res/values/strings.xml <<'NETCORTE_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">NetCorte</string>
+              <string name="status_cut">Internet CORTADO</string>
+              <string name="status_on">Internet activo</string>
+              <string name="btn_cut">Cortar internet</string>
+              <string name="btn_restore">Restaurar internet</string>
+              <string name="float_show">Mostrar botón flotante</string>
+              <string name="float_hide">Ocultar botón flotante</string>
+              <string name="size_label">Tamaño del botón: %1$d dp</string>
+              <string name="alpha_label">Opacidad del botón: %1$d %%</string>
+              <string name="perm_title">Permisos</string>
+              <string name="perm_overlay">Permitir mostrar sobre otras apps</string>
+              <string name="perm_vpn">Autorizar conexión VPN</string>
+              <string name="overlay_needed">Activa el permiso para mostrar sobre otras apps y vuelve a intentarlo</string>
+              <string name="vpn_ok">Permiso de VPN ya concedido</string>
+              <string name="vpn_denied">Sin permiso de VPN no se puede cortar el internet</string>
+              <string name="info">Toca el botón flotante para cortar todo el tráfico y tócalo otra vez para restaurarlo. Arrástralo para moverlo. Verde = internet activo, rojo = cortado.</string>
+              <string name="notif_channel">Botón flotante</string>
+              <string name="notif_title">Botón flotante activo</string>
+              <string name="notif_text">Toca para abrir los ajustes</string>
+              <string name="notif_action">Cortar / Restaurar</string>
+          </resources>
+          NETCORTE_EOF
+          cat > app/src/main/res/values/themes.xml <<'NETCORTE_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="android:Theme.Material.Light.NoActionBar">
+                  <item name="android:colorAccent">#E53935</item>
+              </style>
+          </resources>
+          NETCORTE_EOF
+          cat > app/src/main/res/drawable/ic_launcher.xml <<'NETCORTE_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="96dp"
+              android:height="96dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#E53935"
+                  android:pathData="M12,12m-12,0a12,12 0 1,0 24,0a12,12 0 1,0 -24,0" />
+              <path
+                  android:strokeColor="#FFFFFF"
+                  android:strokeWidth="2"
+                  android:strokeLineCap="round"
+                  android:pathData="M12,5.5 L12,11.5" />
+              <path
+                  android:strokeColor="#FFFFFF"
+                  android:strokeWidth="2"
+                  android:strokeLineCap="round"
+                  android:pathData="M16.24,7.76 A6,6 0 1,1 7.76,7.76" />
+          </vector>
+          NETCORTE_EOF
+          cat > app/src/main/res/drawable/ic_notif.xml <<'NETCORTE_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:strokeColor="#FFFFFF"
+                  android:strokeWidth="2"
+                  android:strokeLineCap="round"
+                  android:pathData="M12,4 L12,12" />
+              <path
+                  android:strokeColor="#FFFFFF"
+                  android:strokeWidth="2"
+                  android:strokeLineCap="round"
+                  android:pathData="M17.66,6.34 A8,8 0 1,1 6.34,6.34" />
+          </vector>
+          NETCORTE_EOF
+          touch .netcorte-ok
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add -A -- . ':!.github'
+          git diff --cached --quiet || git commit -m "Estructura del proyecto NetCorte"
+          git push origin HEAD:${GITHUB_REF_NAME} || echo "No se pudo guardar en el repo, pero la compilacion sigue"
 
       - uses: actions/setup-java@v4
         with:
@@ -19,6 +971,9 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.7
+
+      - name: Aceptar licencias Android
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
       - name: Compilar APK release
         run: gradle assembleRelease --no-daemon
